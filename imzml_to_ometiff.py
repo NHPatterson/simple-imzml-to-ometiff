@@ -2,6 +2,7 @@ from typing import List, Optional, Union
 from pathlib import Path
 import numpy as np
 import pandas as pd
+import h5py
 from pyimzml.ImzMLParser import ImzMLParser, getionimage
 from tifffile import TiffWriter, OmeXml
 from tqdm import tqdm
@@ -17,7 +18,8 @@ def imzml_to_ometiff(
     y_spacing: Optional[Union[float, int]] = None,
     output_dir: str = "./",
     mz_tolerance: float = 0.2,
-    mass_unit: str = "m/z"
+    mass_unit: str = "m/z",
+    imsml: Optional[Union[Path, str]] = None,
 ) -> str:
     """
     Function to read a processed Nano DESI imzML, extract peaks,
@@ -43,16 +45,54 @@ def imzml_to_ometiff(
     """
 
     assert len(peak_names) == len(peak_mzs)
-
     imzml = ImzMLParser(imzml_file)
+
+    if imsml:
+        if Path(imsml).suffix.lower() == ".h5":
+            with h5py.File(imsml, "r") as f:
+                xy_orig = f["xy_original"][:]
+                xy_pad = f["xy_padded"][:]
+        elif Path(imsml).suffix.lower() == ".csv":
+            xy_imsml = pd.read_csv(imsml)
+            xy_pad = np.asarray(xy_imsml[["x_padded", "y_padded"]])
+            xy_orig = np.asarray(xy_imsml[["x_original", "y_original"]])
+        else:
+            raise ValueError(
+                f"{Path(imsml).suffix.lower()} is "
+                f"not a recognized extension : [.h5,.csv]"
+            )
+
+        xy_imzml = np.asarray(imzml.coordinates)[:, [0, 1]]
+        imzml_index = np.arange(0, len(imzml.coordinates), dtype=np.int64)
+
+        df_xy_imzml = pd.DataFrame(
+            np.column_stack([xy_imzml, imzml_index]),
+            columns=["x_original", "y_original", "imzml_index"],
+        )
+        df_xy_pad = pd.DataFrame(
+            np.column_stack([xy_orig, xy_pad]),
+            columns=["x_original", "y_original", "x_pad", "y_pad"]
+        )
+
+        coordinate_df = pd.merge(df_xy_pad, df_xy_imzml)
+
+        coordinate_df.sort_values("imzml_index", inplace=True)
+        coordinate_df["z"] = 1
+
+        new_coords = list(coordinate_df[["x_pad", "y_pad", "z"]].itertuples(index=False, name=None))
+        imzml.coordinates = new_coords
+        imzml.imzmldict["max count of pixels x"] = np.max(coordinate_df["x_pad"]) + 1
+        imzml.imzmldict["max count of pixels y"] = np.max(coordinate_df["y_pad"]) + 1
+
 
     out_file = Path(output_dir) / f"{Path(imzml_file).stem}.ome.tiff"
 
     # parse ion images
     ion_images = []
     for mz in tqdm(peak_mzs, desc="ion images processed"):
-        ii = getionimage(imzml, mz_value=mz, tol=mz_tolerance)
+        ii = getionimage(imzml, mz, tol=mz_tolerance, reduce_func=np.sum)
         ion_images.append(ii)
+
     ion_images = np.stack(ion_images)
 
     # currently, HuBMAP portal supports float32
@@ -193,7 +233,16 @@ def main():
         "--out_dir",
         dest="output_dir",
         type=str,
-        help="where to store output OME-TIFF" "defaults to working directory",
+        help="where to store output OME-TIFF defaults to working directory",
+        default="./",
+    )
+
+    parser.add_argument(
+        "--imsml",
+        dest="imsml",
+        type=str,
+        help="IMS MicroLink registered coordinates",
+        default=None,
     )
 
     parser.add_argument(
@@ -201,15 +250,16 @@ def main():
         dest="mass_unit",
         type=str,
         help="unit of the mass element, i.e. 'm/z' or 'm', appears before the mass value: "
-             " PC(34:0) - m/z 734.58"
+        " PC(34:0) - m/z 734.58",
     )
 
     parser.set_defaults(
-        output_dir=None,
+        output_dir="./",
         x_spacing=None,
         y_spacing=None,
         vertical_um=None,
-        horizontal_um=None
+        horizontal_um=None,
+        imsml=None,
     )
 
     args = parser.parse_args()
@@ -223,15 +273,17 @@ def main():
         raise ValueError(f"no name column in peak data, columns: {peak_data.columns}")
 
     imzml_to_ometiff(
-        args.imzML,
+        args.imzml,
         np.asarray(peak_data["mass"]),
         np.asarray(peak_data["peak_name"]),
-        args.horizontal_um,
-        args.vertical_um,
-        args.x_spacing,
-        args.y_spacing,
-        args.output_dir,
-        args.mz_tol,
+        horizontal_um=args.horizontal_um,
+        vertical_um=args.vertical_um,
+        x_spacing=args.x_spacing,
+        y_spacing=args.y_spacing,
+        output_dir=args.output_dir,
+        mz_tolerance=args.mz_tol,
+        mass_unit=args.mass_unit,
+        imsml=args.imsml,
     )
 
 
@@ -239,3 +291,4 @@ if __name__ == "__main__":
     import sys
 
     sys.exit(main())
+
